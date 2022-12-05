@@ -1,0 +1,1118 @@
+#include <thundersvm/solver/csmosolver.h>
+#include <thundersvm/kernel/smo_kernel.h>
+#include <climits>
+//#include <thundersvm/time_static.h>
+
+#include "mkl.h"
+#include "mkl_omp_offload.h"
+
+
+
+#include <chrono>
+
+typedef std::chrono::high_resolution_clock Clock;
+#define TDEF(x_) std::chrono::high_resolution_clock::time_point x_##_t0, x_##_t1;
+#define TSTART(x_) x_##_t0 = Clock::now();
+#define TEND(x_) x_##_t1 = Clock::now();
+#define TPRINT(x_, str) printf("%-20s \t%.6f\t sec\n", str, std::chrono::duration_cast<std::chrono::microseconds>(x_##_t1 - x_##_t0).count()/1e6);
+#define TINT(x_) std::chrono::duration_cast<std::chrono::microseconds>(x_##_t1 - x_##_t0).count()
+
+
+/*
+ *
+ *
+ *
+ *
+ */
+
+
+const int BCSR_Block_Size = 8;
+
+
+struct SparseData_BCSR{
+	std::vector<kernel_type> val_data;
+	std::vector<int>  row_ptr;
+	std::vector<int>  col_begin_ptr;
+	std::vector<int>  col_end_ptr;
+	std::vector<int>  col_ptr;
+	int block_size;
+	int total_num;
+};
+
+
+struct SparseData{
+	std::vector<kernel_type> val_data;
+	std::vector<int> row_ptr;
+	std::vector<int> col_ptr;
+};
+
+
+void changeCSRtoBCSR(const KernelMatrix &k_mat,SparseData_BCSR &sparseData,int block_size,SparseData &sparsewithoutdenseData,bool is_use=false){
+
+	const int m = k_mat.n_instances_;
+
+	const int n = k_mat.n_features_;
+
+	const kernel_type * csr_val = k_mat.val_.host_data();
+	const int * csr_row_ptr = k_mat.row_ptr_.host_data();
+	const int * csr_col_ind = k_mat.col_ind_.host_data();
+
+
+	//    const int m = 4;
+	//
+	//    const kernel_type csr_val[20] = {10,20,30,40,50,60,70,80};
+	//    const int csr_row_ptr[20] =  {0,2,4,7,8};
+	//    const int csr_col_ind[20] ={0,1,1,3,2,3,4,5};
+
+
+	sparseData.val_data.clear();
+	sparseData.row_ptr.clear();
+	sparseData.col_begin_ptr.clear();
+	sparseData.col_end_ptr.clear();
+
+	int input_val_num=0;
+
+
+	sparseData.block_size = block_size;
+
+	sparseData.row_ptr.push_back(0);
+
+	sparseData.total_num=0;
+
+
+	for (int i=0;i<m;i++){
+
+		int csr_row_begin = csr_row_ptr[i];
+		int csr_row_end = csr_row_ptr[i+1];
+		if (csr_row_end<=csr_row_begin) {
+			sparseData.row_ptr.push_back(sparseData.total_num);
+			continue;
+		}
+
+		sparseData.col_ptr.push_back(input_val_num++);
+		sparseData.val_data.push_back(csr_val[csr_row_begin]);
+		sparseData.col_begin_ptr.push_back(csr_col_ind[csr_row_begin]);
+
+		sparseData.total_num++;
+		int last_begin = csr_col_ind[csr_row_begin];
+		int last_now   = csr_col_ind[csr_row_begin]+1;
+
+		for (int j=csr_row_begin+1;j<csr_row_end;j++){
+
+			if (csr_col_ind[j]-last_now<block_size){
+				for (int k=last_now;k<csr_col_ind[j];k++) {
+					sparseData.val_data.push_back(0);
+					input_val_num++;
+				}
+				input_val_num++;
+				sparseData.val_data.push_back(csr_val[j]);
+				last_now=csr_col_ind[j]+1;
+			} else {
+				sparseData.col_end_ptr.push_back(last_now);
+				sparseData.col_begin_ptr.push_back(csr_col_ind[j]);
+				sparseData.col_ptr.push_back(input_val_num++);
+				sparseData.val_data.push_back(csr_val[j]);
+				last_begin=csr_col_ind[j];
+				last_now=csr_col_ind[j]+1;
+				sparseData.total_num++;
+			}
+
+		}
+		sparseData.col_end_ptr.push_back(last_now);
+		sparseData.row_ptr.push_back(sparseData.total_num);
+	}
+
+
+	printf("Sparse val data size : %d\n",sparseData.val_data.size());
+
+	//    int MaxSizeSum=0;
+	//
+	//    for (int i=0;i<m;i++){
+	////        printf("Row %d ::::::::: \n",i);
+	////        printf("Row Begin : %d |||  End : %d \n",sparseData.row_ptr[i],sparseData.row_ptr[i+1]);
+	//        for (int j=sparseData.row_ptr[i];j<sparseData.row_ptr[i+1];j++){
+	////            printf("Col Begin : %d ||||  Col End : %d\n",sparseData.col_begin_ptr[j],sparseData.col_end_ptr[j]);
+	//            MaxSizeSum=max(MaxSizeSum,sparseData.col_end_ptr[j]-sparseData.col_begin_ptr[j]+1);
+	//        }
+	//    }
+	//
+	//    int *sizeSum = new int[MaxSizeSum+10];
+	//
+	//    for (int i=1;i<=MaxSizeSum;i++) sizeSum[i]=0;
+	//    for (int i=0;i<m;i++){
+	////        printf("Row %d ::::::::: \n",i);
+	////        printf("Row Begin : %d |||  End : %d \n",sparseData.row_ptr[i],sparseData.row_ptr[i+1]);
+	//        for (int j=sparseData.row_ptr[i];j<sparseData.row_ptr[i+1];j++){
+	////            printf("Col Begin : %d ||||  Col End : %d\n",sparseData.col_begin_ptr[j],sparseData.col_end_ptr[j]);
+	//            sizeSum[sparseData.col_end_ptr[j]-sparseData.col_begin_ptr[j]+1]++;
+	//        }
+	//    }
+	//
+	//    for (int i=1;i<=MaxSizeSum;i++){
+	//       if (sizeSum[i]>0) printf("Size %d : %d\n",i,sizeSum[i]);
+	//    }
+	//    printf("Size > 300 : %d\n",sizeSum[301]);
+	/*
+	 *
+	 * 删除部分
+	 *
+	 *
+	 */
+	if (!is_use) return;
+
+
+	sparsewithoutdenseData.val_data.clear();
+	sparsewithoutdenseData.col_ptr.clear();
+	sparsewithoutdenseData.row_ptr.clear();
+	sparsewithoutdenseData.row_ptr.push_back(0);
+
+
+
+
+	SparseData_BCSR denseData;
+	denseData.total_num=0;
+	denseData.val_data.clear();
+	denseData.row_ptr.clear();
+	denseData.col_ptr.clear();
+	denseData.col_begin_ptr.clear();
+	denseData.col_end_ptr.clear();
+
+
+	denseData.row_ptr.push_back(denseData.total_num);
+
+
+	for (int i=0;i<m;i++){
+		int row_begin=sparseData.row_ptr[i];
+		int row_end=sparseData.row_ptr[i+1];
+
+
+		for (int j=row_begin;j<row_end;j++){
+			if (sparseData.col_end_ptr[j]-sparseData.col_begin_ptr[j]>64){
+				denseData.col_ptr.push_back(denseData.val_data.size());
+				int start=sparseData.col_ptr[j];
+				for (int k=0;k<sparseData.col_end_ptr[j]-sparseData.col_begin_ptr[j];k++){
+					denseData.val_data.push_back(sparseData.val_data[start++]);
+
+				}
+				denseData.col_begin_ptr.push_back(sparseData.col_begin_ptr[j]);
+				denseData.col_end_ptr.push_back(sparseData.col_end_ptr[j]);
+				denseData.total_num++;
+			}else{
+				int start=sparseData.col_ptr[j];
+				for (int k=sparseData.col_begin_ptr[j];k<sparseData.col_end_ptr[j];k++){
+					//                   denseData.val_data.push_back(sparseData.val_data[start++]);
+					if (sparseData.val_data[start]>0){
+						sparsewithoutdenseData.val_data.push_back(sparseData.val_data[start]);
+						sparsewithoutdenseData.col_ptr.push_back(k);
+					}
+					start++;
+
+
+				}
+			}
+		}
+		denseData.row_ptr.push_back(denseData.total_num);
+		sparsewithoutdenseData.row_ptr.push_back(sparsewithoutdenseData.val_data.size());
+
+
+
+	}
+
+	sparseData.total_num=denseData.total_num;
+	sparseData.val_data=denseData.val_data;
+	sparseData.row_ptr=denseData.row_ptr;
+	sparseData.col_ptr=denseData.col_ptr;
+	sparseData.col_begin_ptr=denseData.col_begin_ptr;
+	sparseData.col_end_ptr=denseData.col_end_ptr;
+
+	printf("Dense Data : %d\n",denseData.val_data.size());
+
+
+
+}
+
+void dns_csr_mul_CSR_intel_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat,SparseData& sparseData, int nnz,
+		kernel_type* &result){
+	const kernel_type* dense_data = dense_mat.host_data();
+	int* col_data = sparseData.col_ptr.data();
+	int* row_index_data = sparseData.row_ptr.data();
+	kernel_type * sparse_data = sparseData.val_data.data();
+	kernel_type * ref_data = result;
+#pragma omp parallel for num_threads(64)
+	for (int i=0;i<m;i++){
+		int row_begin=row_index_data[i];
+		int row_end=row_index_data[i+1];
+		for (int j=0;j<n;j++){
+			kernel_type sum=0;
+			for (int kk=row_begin;kk<row_end;kk++){
+				sum+=sparse_data[kk]*dense_data[col_data[kk]+j*k];
+			}
+
+			ref_data[i+j*m]=sum;
+		}
+	}
+}
+
+void dns_csr_mul_CSR_MKL_intel_cpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat,SparseData& sparseData, int nnz,
+		kernel_type* &result){
+	const MKL_INT ldx = k;
+	const MKL_INT ldy = m;
+	struct matrix_descr descrA;
+	sparse_matrix_t csrA;
+	kernel_type *values = sparseData.val_data.data();
+	// Create matrix descriptor
+	descrA.type = SPARSE_MATRIX_TYPE_GENERAL;
+	static MKL_INT *columns;
+	static MKL_INT *row_index;
+	static int first_tag = 1;
+	MKL_INT i;
+	if(first_tag){
+		columns = (MKL_INT *)mkl_malloc(sizeof(MKL_INT) * sparseData.val_data.size(), 64);
+		row_index = (MKL_INT *)mkl_malloc(sizeof(MKL_INT) * (m + 1), 64);
+#pragma omp parallel for num_threads(64)
+		for (i = 0; i < sparseData.val_data.size(); i++) {
+			columns[i] = sparseData.col_ptr[i];
+		}
+#pragma omp parallel for num_threads(64)
+		for (i = 0; i < m + 1; i++) {
+			row_index[i] = sparseData.row_ptr[i];
+		}
+	}
+	sparse_layout_t layout = SPARSE_LAYOUT_COLUMN_MAJOR;
+	sparse_status_t ie_status;
+	// Create handle with matrix stored in CSR format
+	ie_status = mkl_sparse_s_create_csr(&csrA, SPARSE_INDEX_BASE_ZERO,
+			m, // number of rows
+			k, // number of cols
+			row_index, row_index + 1, columns, values);
+	ie_status = mkl_sparse_s_mm(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, csrA, descrA,
+			layout, dense_mat.host_data(), n, ldx, 0.0, result, ldy);
+	first_tag = 0;
+}
+
+
+void dns_csr_mul_CSR_MKL_use_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat,SparseData& sparseData, int nnz,
+		kernel_type* &result){
+	const MKL_INT ldx = k;
+	const MKL_INT ldy = m;
+	struct matrix_descr descrA;
+	static sparse_matrix_t csrA;
+	kernel_type *values = sparseData.val_data.data();
+        kernel_type *x = (kernel_type *)dense_mat.host_data();
+        kernel_type *y = (kernel_type *)result;
+	// Create matrix descriptor
+	descrA.type = SPARSE_MATRIX_TYPE_GENERAL;
+	static MKL_INT *columns;
+	static MKL_INT *row_index;
+	static int first_tag = 1;
+#define M k // nCols of A
+#define N m // nRows of A
+#define NRHS n
+#define NNZ nnz
+
+	float alpha = 1.0;
+	float beta = 0.0;
+	MKL_INT i;
+	if(first_tag){
+		columns = (MKL_INT *)mkl_malloc(sizeof(MKL_INT) * NNZ, 64);
+		row_index = (MKL_INT *)mkl_malloc(sizeof(MKL_INT) * (N + 1), 64);
+#pragma omp parallel for num_threads(64)
+		for (i = 0; i < NNZ; i++) {
+			columns[i] = sparseData.col_ptr[i];
+		}
+#pragma omp parallel for num_threads(64)
+		for (i = 0; i < N + 1; i++) {
+			row_index[i] = sparseData.row_ptr[i];
+		}
+	}
+	const int devNum = 0;
+
+	static sparse_matrix_t csrA_gpu1;
+	sparse_status_t status_create1;
+	sparse_status_t status_mm1;
+	sparse_status_t status_destroy1;
+	MKL_INT N1 = N + 1;
+	MKL_INT NNZ1 = NNZ;
+	MKL_INT NRHS_N_1 = N * NRHS;
+
+        sparse_layout_t layout = SPARSE_LAYOUT_COLUMN_MAJOR;
+	// call create_csr/mm/destroy via omp_offload.
+#pragma omp target data map(to:row_index[0:N1],columns[0:NNZ1],values[0:NNZ1],x[0:M*NRHS]) map(tofrom:y[0:NRHS_N_1]) device(devNum) subdevice(0)
+	{
+		printf("Create CSR matrix via omp_offload\n");
+
+		if(first_tag){
+#pragma omp target variant dispatch device(devNum) subdevice(0) use_device_ptr(row_index, columns, values)
+			status_create1 = mkl_sparse_s_create_csr(&csrA_gpu1, SPARSE_INDEX_BASE_ZERO, N, M, row_index, row_index + 1, columns, values);
+		}
+		printf("Compute mkl_sparse_s_mm via omp_offload\n");
+
+#pragma omp target variant dispatch device(devNum) subdevice(0) use_device_ptr(x, y)
+		status_mm1 = mkl_sparse_s_mm(SPARSE_OPERATION_NON_TRANSPOSE, alpha, csrA_gpu1, descrA, layout, x, NRHS, ldx, beta, y, ldy);
+		//
+		//                printf("Destroy the CSR matrix via omp_offload\n");
+		//
+		//#pragma omp target variant dispatch device(devNum)
+		//                status_destroy = mkl_sparse_destroy(csrA_gpu);
+	}
+
+
+
+
+	first_tag = 0;
+}
+
+
+
+
+void dns_csr_mul_BCSR_intel_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat,SparseData_BCSR& sparseDataBcsr, int nnz,
+		SyncArray<kernel_type> &result){
+	const kernel_type* dense_data = dense_mat.host_data();
+	int* col_begin_data = sparseDataBcsr.col_begin_ptr.data();
+	int* col_end_data = sparseDataBcsr.col_end_ptr.data();
+	int* col_data = sparseDataBcsr.col_ptr.data();
+	int* row_index_data = sparseDataBcsr.row_ptr.data();
+	kernel_type * sparse_data = sparseDataBcsr.val_data.data();
+	kernel_type * ref_data = result.host_data();
+#pragma omp parallel for num_threads(64)
+	for (int i=0;i<m;i++){
+		int row_begin=row_index_data[i];
+		int row_end=row_index_data[i+1];
+		for (int j=0;j<n;j++){
+			kernel_type sum=0;
+
+			for (int kk=row_begin;kk<row_end;kk++){
+				int start=col_data[kk];
+				for (int jj=col_begin_data[kk];jj<col_end_data[kk];jj++)
+					sum+=sparse_data[start+jj-col_begin_data[kk]]*dense_data[jj+j*k];
+			}
+
+			ref_data[i+j*m]=sum;
+		}
+	}
+}
+
+void dns_csr_mul_BCSR_with_RBF_intel_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat,SparseData_BCSR& sparseDataBcsr, int nnz,const SyncArray<int> &self_dot0_idx,
+		SyncArray<kernel_type> &result){
+	const kernel_type* dense_data = dense_mat.host_data();
+	int* col_begin_data = sparseDataBcsr.col_begin_ptr.data();
+	int* col_end_data = sparseDataBcsr.col_end_ptr.data();
+	int* col_data = sparseDataBcsr.col_ptr.data();
+	int* row_index_data = sparseDataBcsr.row_ptr.data();
+	kernel_type * sparse_data = sparseDataBcsr.val_data.data();
+
+
+	const int *self_dot0_idx_data = self_dot0_idx.host_data();
+	const kernel_type *self_dot1_data = k_mat.self_dot_.host_data();
+	kernel_type gamma=k_mat.param.gamma;
+
+	kernel_type* result_data = new kernel_type[m*n];
+	kernel_type * ref_data = result.host_data();
+#pragma omp parallel for num_threads(64)
+	for (int i=0;i<m;i++){
+		int row_begin=row_index_data[i];
+		int row_end=row_index_data[i+1];
+		for (int j=0;j<n;j++){
+			kernel_type sum=0;
+
+			for (int kk=row_begin;kk<row_end;kk++){
+				int start=col_data[kk];
+				for (int jj=col_begin_data[kk];jj<col_end_data[kk];jj++)
+					sum+=sparse_data[start+jj-col_begin_data[kk]]*dense_data[jj+j*k];
+			}
+
+			ref_data[i+j*m]=expf(-(self_dot1_data[self_dot0_idx_data[j]] + self_dot1_data[i] - sum*2)*gamma);
+		}
+	}
+}
+
+
+void dns_csr_mul_with_RBF_intel_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat, const SyncArray<kernel_type> &csr_val,
+		const SyncArray<int> &csr_row_ptr, const SyncArray<int> &csr_col_ind, int nnz,const SyncArray<int> &self_dot0_idx,
+		SyncArray<kernel_type> &result) {
+	const kernel_type* dense_data = dense_mat.host_data();
+	const int* col_index_data = csr_col_ind.host_data();
+	const int* row_index_data = csr_row_ptr.host_data();
+	const kernel_type * sparse_data = csr_val.host_data();
+
+
+	const int *self_dot0_idx_data = self_dot0_idx.host_data();
+	const kernel_type *self_dot1_data = k_mat.self_dot_.host_data();
+	kernel_type gamma=k_mat.param.gamma;
+
+
+	//    for (int i = 0; i < n; i++) {
+	//        for (int j = 0; j < m; ++j) {
+	//            dot_product_data[i * m + j] = expf(
+	//                    -(self_dot1_data[self_dot0_idx_data[i]] + self_dot1_data[j] - dot_product_data[i * m + j] * 2) *
+	//                    gamma);
+	//        }
+	//    }
+
+
+
+
+
+	kernel_type* result_data = new kernel_type[m*n];
+	kernel_type * ref_data = result.host_data();
+#pragma omp parallel for num_threads(64)
+	for (int i=0;i<m;i++){
+		int row_begin=row_index_data[i];
+		int row_end=row_index_data[i+1];
+		for (int j=0;j<n;j++){
+			kernel_type sum=0;
+
+			for (int kk=row_begin;kk<row_end;kk++){
+				sum+=sparse_data[kk]*dense_data[col_index_data[kk]+j*k];
+			}
+
+			ref_data[i+j*m]=expf(-(self_dot1_data[self_dot0_idx_data[j]] + self_dot1_data[i] - sum*2)*gamma);
+		}
+	}
+}
+
+void dns_csr_mul_with_poly_intel_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat, const SyncArray<kernel_type> &csr_val,
+		const SyncArray<int> &csr_row_ptr, const SyncArray<int> &csr_col_ind, int nnz,
+		SyncArray<kernel_type> &result) {
+	const kernel_type* dense_data = dense_mat.host_data();
+	const int* col_index_data = csr_col_ind.host_data();
+	const int* row_index_data = csr_row_ptr.host_data();
+	const kernel_type * sparse_data = csr_val.host_data();
+
+
+
+
+	//    for (int i = 0; i < n; i++) {
+	//        for (int j = 0; j < m; ++j) {
+	//            dot_product_data[i * m + j] = expf(
+	//                    -(self_dot1_data[self_dot0_idx_data[i]] + self_dot1_data[j] - dot_product_data[i * m + j] * 2) *
+	//                    gamma);
+	//        }
+	//    }
+
+
+	const kernel_type gamma = k_mat.param.gamma;
+	const kernel_type coef0 = k_mat.param.coef0;
+	const int degree = k_mat.param.degree;
+
+
+
+	kernel_type* result_data = new kernel_type[m*n];
+	kernel_type * ref_data = result.host_data();
+#pragma omp parallel for num_threads(64)
+	for (int i=0;i<m;i++){
+		int row_begin=row_index_data[i];
+		int row_end=row_index_data[i+1];
+		for (int j=0;j<n;j++){
+			kernel_type sum=0;
+			for (int kk=row_begin;kk<row_end;kk++){
+				sum+=sparse_data[kk]*dense_data[col_index_data[kk]+j*k];
+			}
+
+			ref_data[i+j*m]=powf(gamma*sum + coef0, degree);
+		}
+	}
+}
+
+void dns_csr_mul_with_sigmoid_intel_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat, const SyncArray<kernel_type> &csr_val,
+		const SyncArray<int> &csr_row_ptr, const SyncArray<int> &csr_col_ind, int nnz,
+		SyncArray<kernel_type> &result) {
+	const kernel_type* dense_data = dense_mat.host_data();
+	const int* col_index_data = csr_col_ind.host_data();
+	const int* row_index_data = csr_row_ptr.host_data();
+	const kernel_type * sparse_data = csr_val.host_data();
+
+
+
+
+	//    for (int i = 0; i < n; i++) {
+	//        for (int j = 0; j < m; ++j) {
+	//            dot_product_data[i * m + j] = expf(
+	//                    -(self_dot1_data[self_dot0_idx_data[i]] + self_dot1_data[j] - dot_product_data[i * m + j] * 2) *
+	//                    gamma);
+	//        }
+	//    }
+
+
+	const kernel_type gamma = k_mat.param.gamma;
+	const kernel_type coef0 = k_mat.param.coef0;
+
+
+
+	kernel_type* result_data = new kernel_type[m*n];
+	kernel_type * ref_data = result.host_data();
+#pragma omp parallel for num_threads(64)
+	for (int i=0;i<m;i++){
+		int row_begin=row_index_data[i];
+		int row_end=row_index_data[i+1];
+		for (int j=0;j<n;j++){
+			kernel_type sum=0;
+			for (int kk=row_begin;kk<row_end;kk++){
+				sum+=sparse_data[kk]*dense_data[col_index_data[kk]+j*k];
+			}
+
+			ref_data[i+j*m]=tanhf(gamma * sum + coef0);
+		}
+	}
+}
+
+
+void dns_csr_mul_intel_gpu(const KernelMatrix &k_mat,int m, int n, int k, const SyncArray<kernel_type> &dense_mat, const SyncArray<kernel_type> &csr_val,
+		const SyncArray<int> &csr_row_ptr, const SyncArray<int> &csr_col_ind, int nnz,
+		SyncArray<kernel_type> &result){
+	//CHECK_EQ(dense_mat.size(), n * k_mat.n_features_) << "dense matrix features doesn't match";
+	const kernel_type* dense_data = dense_mat.host_data();
+	const int* col_index_data = csr_col_ind.host_data();
+	const int* row_index_data = csr_row_ptr.host_data();
+	const kernel_type * sparse_data = csr_val.host_data();
+
+	kernel_type* result_data = new kernel_type[m*n];
+	kernel_type * ref_data = result.host_data();
+#pragma omp parallel for num_threads(64)
+	for (int i=0;i<m;i++){
+		int row_begin=row_index_data[i];
+		int row_end=row_index_data[i+1];
+		for (int j=0;j<n;j++){
+			kernel_type sum=0;
+			for (int kk=row_begin;kk<row_end;kk++){
+				sum+=sparse_data[kk]*dense_data[col_index_data[kk]+j*k];
+			}
+			ref_data[i+j*m]=sum;
+		}
+	}
+}
+
+void get_working_set_ins_intel_gpu(const KernelMatrix &k_mat,const SyncArray<kernel_type> &val, const SyncArray<int> &col_ind, const SyncArray<int> &row_ptr,
+		const SyncArray<int> &data_row_idx, SyncArray<kernel_type> &data_rows, int m, int n){
+	const int *data_row_idx_data = data_row_idx.host_data();
+	kernel_type *data_rows_data = data_rows.host_data();
+	const int *row_ptr_data = row_ptr.host_data();
+	const int *col_ind_data = col_ind.host_data();
+	const kernel_type *val_data = val.host_data();
+#pragma omp parallel for schedule(guided)
+	for (int i = 0; i < m; i++) {
+		int row = data_row_idx_data[i];
+		for (int j = row_ptr_data[row]; j < row_ptr_data[row + 1]; ++j) {
+			int col = col_ind_data[j];
+			data_rows_data[i * n + col] = val_data[j]; //row major
+		}
+	}
+}
+/*
+ * KernelMatrix::dns_csr_mul(const SyncArray<kernel_type> &dense_mat, int n_rows, SyncArray<kernel_type> &result) const {
+ CHECK_EQ(dense_mat.size(), n_rows * n_features_) << "dense matrix features doesn't match";
+ svm_kernel::dns_csr_mul(n_instances_, n_rows, n_features_, dense_mat, val_, row_ptr_, col_ind_, nnz_, result);
+ }
+ */
+
+void MergeResult(kernel_type* dot_product,kernel_type* dot_product_sparse,int size){
+#pragma omp parallel for
+	for(int i=0;i<size;i++)
+		dot_product[i]+=dot_product_sparse[i];
+}
+void MergeTransResult(kernel_type* dot_product,kernel_type* dot_product_sparse,int size){
+#pragma omp parallel for
+	for(int i=0;i<size;i++)
+		dot_product[i]+=dot_product_sparse[i];
+}
+
+
+
+void get_dot_product_dns_csr_intel_gpu(const KernelMatrix &k_mat,SparseData_BCSR& sparseDataBcsr,SparseData& sparsewithoutdenseData,const SyncArray<int> &idx, SyncArray<kernel_type> &dot_product , SyncArray<kernel_type> &data_rows){
+	//    SyncArray<kernel_type> data_rows(idx.size() * k_mat.n_features_);
+	//    data_rows.mem_set(0);
+	memset(data_rows.host_data(),0x00,sizeof(kernel_type)*idx.size()*k_mat.n_features_);
+	get_working_set_ins_intel_gpu(k_mat,k_mat.val_, k_mat.col_ind_, k_mat.row_ptr_, idx, data_rows, idx.size(), k_mat.n_features_);
+	TDEF(dense)
+		TSTART(dense)
+		dns_csr_mul_BCSR_intel_gpu(k_mat,k_mat.n_instances_,idx.size(),k_mat.n_features_,data_rows,sparseDataBcsr,k_mat.nnz_,dot_product);
+	TEND(dense)
+		TPRINT(dense,"$#%dense dense mul time  : " )
+
+		TDEF(sparse)
+		TSTART(sparse)
+		kernel_type *dot_product_sparse=new kernel_type[k_mat.n_instances_*idx.size()];
+	dns_csr_mul_CSR_MKL_intel_cpu(k_mat,k_mat.n_instances_,idx.size(),k_mat.n_features_,data_rows,sparsewithoutdenseData,k_mat.nnz_,dot_product_sparse);
+	TEND(sparse)
+		TPRINT(sparse,"$#%sparse dense mul time : ")
+
+		MergeResult(dot_product.host_data(),dot_product_sparse,k_mat.n_instances_*idx.size());
+
+
+	delete dot_product_sparse;
+
+	//    switch (k_mat.param.kernel_type) {
+	//        case SvmParam::RBF:
+	//        case SvmParam::PRECOMPUTED://precomputed uses rbf as default
+	////            dns_csr_mul_with_RBF_intel_gpu(k_mat,k_mat.n_instances_,idx.size(),k_mat.n_features_,data_rows,k_mat.val_,k_mat.row_ptr_,k_mat.col_ind_,k_mat.nnz_,idx,dot_product);
+	//            dns_csr_mul_BCSR_with_RBF_intel_gpu(k_mat,k_mat.n_instances_,idx.size(),k_mat.n_features_,data_rows,sparseDataBcsr,k_mat.nnz_,idx,dot_product);
+	//
+	//            break;
+	//        case SvmParam::LINEAR:
+	//            dns_csr_mul_intel_gpu(k_mat,k_mat.n_instances_,idx.size(),k_mat.n_features_,data_rows,k_mat.val_,k_mat.row_ptr_,k_mat.col_ind_,k_mat.nnz_,dot_product);
+	//            break;
+	//        case SvmParam::POLY:
+	//            dns_csr_mul_with_poly_intel_gpu(k_mat,k_mat.n_instances_,idx.size(),k_mat.n_features_,data_rows,k_mat.val_,k_mat.row_ptr_,k_mat.col_ind_,k_mat.nnz_,dot_product);
+	//            break;
+	//        case SvmParam::SIGMOID:
+	//            dns_csr_mul_with_sigmoid_intel_gpu(k_mat,k_mat.n_instances_,idx.size(),k_mat.n_features_,data_rows,k_mat.val_,k_mat.row_ptr_,k_mat.col_ind_,k_mat.nnz_,dot_product);
+	//            break;
+	//    }
+
+}
+
+void RBF_kernel_intel_gpu(const SyncArray<int> &self_dot0_idx, const SyncArray<kernel_type> &self_dot1,
+		SyncArray<kernel_type> &dot_product, int m,
+		int n, kernel_type gamma){
+	kernel_type *dot_product_data = dot_product.host_data();
+	const int *self_dot0_idx_data = self_dot0_idx.host_data();
+	const kernel_type *self_dot1_data = self_dot1.host_data();
+#pragma omp parallel for schedule(guided)
+	for (int i = 0; i < m; i++) {
+		for (int j = 0; j < n; ++j) {
+			dot_product_data[i * n + j] = expf(
+					-(self_dot1_data[self_dot0_idx_data[i]] + self_dot1_data[j] - dot_product_data[i * n + j] * 2) *
+					gamma);
+		}
+	}
+}
+
+void poly_kernel_intel_gpu(SyncArray<kernel_type> &dot_product, kernel_type gamma, kernel_type coef0, int degree, int mn){
+	kernel_type *dot_product_data = dot_product.host_data();
+#pragma omp parallel for schedule(guided)
+	for (int idx = 0; idx < mn; idx++) {
+		dot_product_data[idx] = powf(gamma * dot_product_data[idx] + coef0, degree);
+	}
+}
+
+void sigmoid_kernel_intel_gpu(SyncArray<kernel_type> &dot_product, kernel_type gamma, kernel_type coef0, int mn){
+	kernel_type *dot_product_data = dot_product.host_data();
+#pragma omp parallel for schedule(guided)
+	for (int idx = 0; idx < mn; idx++) {
+		dot_product_data[idx] = tanhf(gamma * dot_product_data[idx] + coef0);
+	}
+}
+
+void get_rows_intel_gpu(const KernelMatrix &k_mat,SparseData_BCSR& sparseDataBcsr,SparseData& sparsewithoutdenseData,const SyncArray<int> &idx,
+		SyncArray<kernel_type> &kernel_rows,SyncArray<kernel_type> &data_rows){
+
+
+	CHECK_GE(kernel_rows.size(), idx.size() * k_mat.n_instances_) << "kernel_rows memory is too small";
+#ifdef USE_CUDA
+	get_dot_product_dns_csr(idx, kernel_rows);
+#else
+
+	if(k_mat.n_features_ < 1000000)
+		get_dot_product_dns_csr_intel_gpu(k_mat,sparseDataBcsr,sparsewithoutdenseData,idx, kernel_rows,data_rows);
+	//    else
+	//        get_dot_product_csr_csr(idx, kernel_rows);
+	//    get_dot_product_dns_dns(idx, kernel_rows);
+#endif
+	switch (k_mat.param.kernel_type) {
+		case SvmParam::RBF:
+		case SvmParam::PRECOMPUTED://precomputed uses rbf as default
+			//In this;
+			RBF_kernel_intel_gpu(idx, k_mat.self_dot_, kernel_rows, idx.size(), k_mat.n_instances_, k_mat.param.gamma);
+
+			//printf("RBF OR PRECOMPUTED\n");
+			break;
+		case SvmParam::LINEAR:
+			//do nothing
+			//printf("LINEAR\n");
+			break;
+		case SvmParam::POLY:
+			poly_kernel_intel_gpu(kernel_rows, k_mat.param.gamma, k_mat.param.coef0, k_mat.param.degree, kernel_rows.size());
+			//printf("POLY\n");
+			break;
+		case SvmParam::SIGMOID:
+			sigmoid_kernel_intel_gpu(kernel_rows, k_mat.param.gamma, k_mat.param.coef0, kernel_rows.size());
+			//printf("SIGMOID\n");
+
+			break;
+	}
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ */
+
+
+
+
+
+
+
+
+
+
+using namespace std::chrono;
+
+using namespace svm_kernel;
+
+void
+CSMOSolver::solve(const KernelMatrix &k_mat, const SyncArray<int> &y, SyncArray<float_type> &alpha, float_type &rho,
+		SyncArray<float_type> &f_val, float_type eps, float_type Cp, float_type Cn, int ws_size,
+		int out_max_iter) const {
+	int n_instances = k_mat.n_instances();
+	int q = ws_size / 2;
+
+
+
+
+
+	SyncArray<int> working_set(ws_size);
+	SyncArray<int> working_set_first_half(q);
+	SyncArray<int> working_set_last_half(q);
+#ifdef USE_CUDA
+	working_set_first_half.set_device_data(working_set.device_data());
+	working_set_last_half.set_device_data(&working_set.device_data()[q]);
+#endif
+	working_set_first_half.set_host_data(working_set.host_data());
+	working_set_last_half.set_host_data(&working_set.host_data()[q]);
+
+	SyncArray<int> f_idx(n_instances);
+	SyncArray<int> f_idx2sort(n_instances);
+	SyncArray<float_type> f_val2sort(n_instances);
+	SyncArray<float_type> alpha_diff(ws_size);
+	SyncArray<float_type> diff(2);
+
+	SyncArray<kernel_type> k_mat_rows(ws_size * k_mat.n_instances());
+	SyncArray<kernel_type> k_mat_rows_first_half(q * k_mat.n_instances());
+	SyncArray<kernel_type> k_mat_rows_last_half(q * k_mat.n_instances());
+
+
+	SyncArray<kernel_type> data_rows(ws_size*k_mat.n_features_);
+
+
+#ifdef USE_CUDA
+	k_mat_rows_first_half.set_device_data(k_mat_rows.device_data());
+	k_mat_rows_last_half.set_device_data(&k_mat_rows.device_data()[q * k_mat.n_instances()]);
+#else
+	k_mat_rows_first_half.set_host_data(k_mat_rows.host_data());
+	k_mat_rows_last_half.set_host_data(&k_mat_rows.host_data()[q * k_mat.n_instances()]);
+#endif
+	int *f_idx_data = f_idx.host_data();
+	for (int i = 0; i < n_instances; ++i) {
+		f_idx_data[i] = i;
+	}
+	init_f(alpha, y, k_mat, f_val);
+	LOG(INFO) << "training start";
+
+	int max_iter = max(100000, ws_size > INT_MAX / 100 ? INT_MAX : 100 * ws_size);
+	long long local_iter = 0;
+
+	//avoid infinite loop of repeated local diff
+	int same_local_diff_cnt = 0;
+	float_type previous_local_diff = INFINITY;
+	int swap_local_diff_cnt = 0;
+	float_type last_local_diff = INFINITY;
+	float_type second_last_local_diff = INFINITY;
+
+	high_resolution_clock::time_point t0,t1;
+	double dt0=0.0;
+
+	t0 = high_resolution_clock::now();
+
+
+
+	/*
+	 *
+	 * 常量打印
+	 *
+	 *
+	 */
+
+	printf("ws_size : %d\n",ws_size);
+
+
+	SparseData_BCSR sparseData;
+	SparseData sparsewithoutdenseData;
+	printf("---------------------------------------------------------------\n");
+	changeCSRtoBCSR(k_mat,sparseData,BCSR_Block_Size,sparsewithoutdenseData,true);
+
+
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,2);
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,4);
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,8);
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,16);
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,32);
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,64);
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,128);
+	//    printf("@@@---------------------------------------------------------------\n");
+	//    changeCSRtoBCSR(k_mat,sparseData,256);
+	//
+
+
+	TDEF(select)
+		TDEF(workset)
+		TDEF(matrix)
+		long long all_select=0;
+	long long all_workset=0;
+	long long all_matrix=0;
+	float_type obj;
+	for (int iter = 0;; ++iter) {
+		//select working set
+		f_idx2sort.copy_from(f_idx);
+		f_val2sort.copy_from(f_val);
+		sort_f(f_val2sort, f_idx2sort);
+		vector<int> ws_indicator(n_instances, 0);
+
+		TSTART(select)
+			if (0 == iter) {
+				TSTART(workset)
+					select_working_set(ws_indicator, f_idx2sort, y, alpha, Cp, Cn, working_set);
+				TEND(workset)
+					TPRINT(workset,"#$# work set one time : ");
+				all_workset+= TINT(workset);
+
+				TSTART(matrix)
+					//            k_mat.get_rows(working_set, k_mat_rows);
+					get_rows_intel_gpu(k_mat,sparseData,sparsewithoutdenseData,working_set, k_mat_rows,data_rows);
+				TEND(matrix)
+					TPRINT(matrix,"#$# matrix one time : ");
+				all_matrix+= TINT(matrix);
+			} else {
+				TSTART(workset)
+					working_set_first_half.copy_from(working_set_last_half);
+				int *working_set_data = working_set.host_data();
+				for (int i = 0; i < q; ++i) {
+					ws_indicator[working_set_data[i]] = 1;
+				}
+				select_working_set(ws_indicator, f_idx2sort, y, alpha, Cp, Cn, working_set_last_half);
+				TEND(workset)
+					TPRINT(workset,"#$# work set one time : ");
+				all_workset+= TINT(workset);
+
+				TSTART(matrix)
+					k_mat_rows_first_half.copy_from(k_mat_rows_last_half);
+				//k_mat.get_rows(working_set_last_half, k_mat_rows_last_half);
+				get_rows_intel_gpu(k_mat,sparseData,sparsewithoutdenseData,working_set_last_half, k_mat_rows_last_half,data_rows);
+
+				TEND(matrix)
+					TPRINT(matrix,"#$# matrix one time : ");
+				all_matrix+= TINT(matrix);
+
+			}
+		TEND(select)
+			all_select+= TINT(select);
+		TPRINT(select,"#$# select one time :")
+			//local smo
+			smo_kernel(y, f_val, alpha, alpha_diff, working_set, Cp, Cn, k_mat_rows, k_mat.diag(), n_instances, eps, diff,
+					max_iter);
+		//update f
+		update_f(f_val, alpha_diff, k_mat_rows, k_mat.n_instances());
+		float_type *diff_data = diff.host_data();
+		local_iter += diff_data[1];
+
+		//track unchanged diff
+		if (fabs(diff_data[0] - previous_local_diff) < eps * 0.001) {
+			same_local_diff_cnt++;
+		} else {
+			same_local_diff_cnt = 0;
+			previous_local_diff = diff_data[0];
+		}
+
+		//track unchanged swapping diff
+		if(fabs(diff_data[0] - second_last_local_diff) < eps * 0.001){
+			swap_local_diff_cnt++;
+		} else {
+			swap_local_diff_cnt = 0;
+		}
+		second_last_local_diff = last_local_diff;
+		last_local_diff = diff_data[0];
+
+		if (iter % 1 == 0)
+			LOG(INFO) << "global iter = " << iter << ", total local iter = " << local_iter << ", diff = "
+				<< diff_data[0];
+		//todo find some other ways to deal unchanged diff
+		//training terminates in three conditions: 1. diff stays unchanged; 2. diff is closed to 0; 3. training reaches the limit of iterations.
+		//repeatedly swapping between two diffs
+		if ((same_local_diff_cnt >= 10 && fabs(diff_data[0] - 2.0) > eps) || diff_data[0] < eps ||
+				(out_max_iter != -1) && (iter == out_max_iter) ||
+				(swap_local_diff_cnt >= 10 && fabs(diff_data[0] - 2.0) > eps)) {
+			rho = calculate_rho(f_val, y, alpha, Cp, Cn);
+			LOG(INFO) << "global iter = " << iter << ", total local iter = " << local_iter << ", diff = "
+				<< diff_data[0];
+			LOG(INFO) << "training finished";
+			obj = calculate_obj(f_val, alpha, y);
+			LOG(INFO) << "obj = " << obj;
+			break;
+		}
+	}
+
+	printf("#$# All Select Time : %f\n",1.0*all_select/1e6);
+	printf("#$# All WorkSet Time : %f\n",1.0*all_workset/1e6);
+	printf("#$# All Matrix Time : %f\n",1.0*all_matrix/1e6);
+
+	t1 = high_resolution_clock::now();
+	dt0 = dt0 + duration<double>(t1-t0).count();
+	printf( "\nFOM: main loop : %11.6lf ms, %11.6lfs \n\n", dt0*1000, dt0 );
+	FILE* file = fopen("result.txt", "w");
+	fprintf(file, "obj = %.20f\n", obj);
+	fclose(file);
+}
+
+void
+CSMOSolver::select_working_set(vector<int> &ws_indicator, const SyncArray<int> &f_idx2sort, const SyncArray<int> &y,
+		const SyncArray<float_type> &alpha, float_type Cp, float_type Cn,
+		SyncArray<int> &working_set) const {
+	int n_instances = ws_indicator.size();
+	int p_left = 0;
+	int p_right = n_instances - 1;
+	int n_selected = 0;
+	const int *index = f_idx2sort.host_data();
+	const int *y_data = y.host_data();
+	const float_type *alpha_data = alpha.host_data();
+	int *working_set_data = working_set.host_data();
+	while (n_selected < working_set.size()) {
+		int i;
+		if (p_left < n_instances) {
+			i = index[p_left];
+			while (ws_indicator[i] == 1 || !is_I_up(alpha_data[i], y_data[i], Cp, Cn)) {
+				//construct working set of I_up
+				p_left++;
+				if (p_left == n_instances) break;
+				i = index[p_left];
+			}
+			if (p_left < n_instances) {
+				working_set_data[n_selected++] = i;
+				ws_indicator[i] = 1;
+			}
+		}
+		if (p_right >= 0) {
+			i = index[p_right];
+			while (ws_indicator[i] == 1 || !is_I_low(alpha_data[i], y_data[i], Cp, Cn)) {
+				//construct working set of I_low
+				p_right--;
+				if (p_right == -1) break;
+				i = index[p_right];
+			}
+			if (p_right >= 0) {
+				working_set_data[n_selected++] = i;
+				ws_indicator[i] = 1;
+			}
+		}
+
+	}
+}
+
+float_type
+CSMOSolver::calculate_rho(const SyncArray<float_type> &f_val, const SyncArray<int> &y, SyncArray<float_type> &alpha,
+		float_type Cp,
+		float_type Cn) const {
+	int n_free = 0;
+	double sum_free = 0;
+	float_type up_value = INFINITY;
+	float_type low_value = -INFINITY;
+	const float_type *f_val_data = f_val.host_data();
+	const int *y_data = y.host_data();
+	float_type *alpha_data = alpha.host_data();
+	for (int i = 0; i < alpha.size(); ++i) {
+		if (is_free(alpha_data[i], y_data[i], Cp, Cn)) {
+			n_free++;
+			sum_free += f_val_data[i];
+		}
+		if (is_I_up(alpha_data[i], y_data[i], Cp, Cn)) up_value = min(up_value, f_val_data[i]);
+		if (is_I_low(alpha_data[i], y_data[i], Cp, Cn)) low_value = max(low_value, f_val_data[i]);
+	}
+	return 0 != n_free ? (sum_free / n_free) : (-(up_value + low_value) / 2);
+}
+
+void CSMOSolver::init_f(const SyncArray<float_type> &alpha, const SyncArray<int> &y, const KernelMatrix &k_mat,
+		SyncArray<float_type> &f_val) const {
+	//todo auto set batch size
+	int batch_size = 100;
+	vector<int> idx_vec;
+	vector<float_type> alpha_diff_vec;
+	const int *y_data = y.host_data();
+	const float_type *alpha_data = alpha.host_data();
+	for (int i = 0; i < alpha.size(); ++i) {
+		if (alpha_data[i] != 0) {
+			idx_vec.push_back(i);
+			alpha_diff_vec.push_back(-alpha_data[i] * y_data[i]);
+		}
+		if (idx_vec.size() > batch_size || (i == alpha.size() - 1 && !idx_vec.empty())) {
+			SyncArray<int> idx(idx_vec.size());
+			SyncArray<float_type> alpha_diff(idx_vec.size());
+			idx.copy_from(idx_vec.data(), idx_vec.size());
+			alpha_diff.copy_from(alpha_diff_vec.data(), idx_vec.size());
+			SyncArray<kernel_type> kernel_rows(idx.size() * k_mat.n_instances());
+			k_mat.get_rows(idx, kernel_rows);
+			update_f(f_val, alpha_diff, kernel_rows, k_mat.n_instances());
+			idx_vec.clear();
+			alpha_diff_vec.clear();
+		}
+	}
+}
+
+void
+CSMOSolver::smo_kernel(const SyncArray<int> &y, SyncArray<float_type> &f_val, SyncArray<float_type> &alpha,
+		SyncArray<float_type> &alpha_diff,
+		const SyncArray<int> &working_set, float_type Cp, float_type Cn,
+		const SyncArray<kernel_type> &k_mat_rows,
+		const SyncArray<kernel_type> &k_mat_diag, int row_len, float_type eps,
+		SyncArray<float_type> &diff,
+		int max_iter) const {
+	c_smo_solve(y, f_val, alpha, alpha_diff, working_set, Cp, Cn, k_mat_rows, k_mat_diag, row_len, eps, diff, max_iter);
+}
+
+float_type CSMOSolver::calculate_obj(const SyncArray<float_type> &f_val, const SyncArray<float_type> &alpha,
+		const SyncArray<int> &y) const {
+	//todo use parallel reduction for gpu and cpu
+	int n_instances = f_val.size();
+	float_type obj = 0;
+	const float_type *f_val_data = f_val.host_data();
+	const float_type *alpha_data = alpha.host_data();
+	const int *y_data = y.host_data();
+	for (int i = 0; i < n_instances; ++i) {
+		obj += alpha_data[i] - (f_val_data[i] + y_data[i]) * alpha_data[i] * y_data[i] / 2;
+	}
+	return -obj;
+}
+
+
